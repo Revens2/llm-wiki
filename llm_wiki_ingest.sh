@@ -24,6 +24,8 @@ MANIFEST="${WIKI_DIR}/.ingested_manifest.jsonl"
 MANIFEST_V1="${WIKI_DIR}/.ingested_manifest"
 STAGING_ROOT="${WIKI_DIR}/.staging"
 STATE_DIR="/var/lib/llm-wiki"
+EXTRACT_SPOOL="${EXTRACT_SPOOL:-${STATE_DIR}/spool/extract}"
+PUBLISH_REQUEST="${PUBLISH_REQUEST:-${STATE_DIR}/publish.request}"
 SPOOL_DIR="${STATE_DIR}/notify-spool"
 INGEST_DUE="${STATE_DIR}/ingest-due-at"
 LINT_DUE="${STATE_DIR}/lint-due-at"
@@ -53,7 +55,7 @@ export EXTRACT_MODEL SUBMIT_MODE MIN_INTERVAL_MS MAX_INTERVAL_MS \
        CHUNK_MIN_TOKENS_FLOOR CHUNK_TARGET_RATIO CHUNK_OVERLAP_RATIO \
        MAX_TPM_REJECTS BYTES_PER_TOKEN INDEX_PAGE_SIZE INDEX_PAGINATE_OVER \
        EXTRACT_MODEL_CASCADE DAILY_CONFIRM_STRIKES DAILY_CONFIRM_MAX_WAIT_S \
-       QUOTA_RESET_TZ 2>/dev/null || true
+       QUOTA_RESET_TZ EXTRACT_SPOOL 2>/dev/null || true
 
 # --- Source LUE par l ingestion. Distincte de WIKI_DIR, qui est la cible ECRITE.
 # Defaut retro-compatible : ${WIKI_DIR}/raw. En production elle vaut
@@ -635,6 +637,57 @@ cmd_extract() {
     return $rc
 }
 
+# ---------------------------------------------------------------- passe 2
+# PASSE 2 (lot 3) : fusion du spool d extraction dans le wiki. Aucun appel
+# modele, donc aucun quota consomme : elle DOIT tourner meme quand la passe 1
+# s est arretee sur un 429 (sortie 75), sinon le travail LLM deja paye reste au
+# spool et le wiki n avance jamais.
+cmd_merge() {
+    local rc=0
+    log "passe 2 (fusion) : spool=${EXTRACT_SPOOL} vault=${WIKI_DIR}"
+    python3 /usr/local/bin/llm_wiki_merge.py \
+        --spool "$EXTRACT_SPOOL" \
+        --vault "$WIKI_DIR" \
+        --manifest "$MANIFEST" || rc=$?
+    return $rc
+}
+
+# ------------------------------------------------------------ pipeline nominal
+# CHEMIN NOMINAL (lot 2/3) : passe 1 puis passe 2, puis demande de publication.
+#
+# Defaut historique = cmd_run, qui pilote `agy` de bout en bout. Ce chemin est
+# le ROLLBACK depuis lot 2 (SUBMIT_MODE=agy) : le laisser en point d entree du
+# service faisait tourner en production un chemin explicitement documente comme
+# obsolete -- et c est lui, pas le quota, qui produisait
+# `Error: declaring permissions: cortex tool write_to_file`.
+#
+# Sortie 75 (quota) de la passe 1 n interrompt PAS la passe 2 : le code de
+# retour du pipeline reste celui de la passe 1 pour que la logique de reprise
+# (on_exit / ingest-due-at) continue de voir le quota.
+cmd_pipeline() {
+    local rc_e=0 rc_m=0
+    cmd_extract "${1:-}" || rc_e=$?
+    cmd_merge || rc_m=$?
+    if [ "$rc_m" -ne 0 ]; then
+        err "passe 2 en echec (rc=${rc_m})"
+        [ "$rc_e" -eq 0 ] && rc_e="$rc_m"
+    fi
+    publish_request
+    return "$rc_e"
+}
+
+# Demande de publication du wiki vers Drive. Depose un marqueur consomme par
+# llm-wiki-publish.path (User=juliann, seul compte porteur du remote gdrive:).
+# Meme separation que llm-wiki-ingest-request : le moteur n a pas le remote, et
+# le publieur n a pas le wiki en ecriture.
+publish_request() {
+    if : > "$PUBLISH_REQUEST" 2>/dev/null; then
+        log "publication demandee (${PUBLISH_REQUEST})"
+    else
+        err "marqueur de publication non ecrit : ${PUBLISH_REQUEST}"
+    fi
+}
+
 # ---------------------------------------------------------------- dispatch
 case "${1:-}" in
     --status)           cmd_status ;;
@@ -642,7 +695,16 @@ case "${1:-}" in
     --retry)            cmd_retry "${2:-}" ;;
     --migrate-manifest) cmd_migrate ;;
     --extract)          cmd_extract "${2:-}" ;;
+    --merge)            cmd_merge ;;
+    --publish)          publish_request ;;
     --dry-run)          cmd_run 1 ;;
-    "")                 cmd_run 0 ;;
-    *) err "usage: $0 [--extract [n]|--dry-run|--status|--list-failed|--retry <cible>|--migrate-manifest]"; exit 2 ;;
+    # Point d entree du service. `agy` reste joignable, mais seulement si on le
+    # demande explicitement par SUBMIT_MODE : il ne peut plus etre le defaut.
+    "")                 if [ "${SUBMIT_MODE:-interactive}" = "agy" ]; then
+                            log "SUBMIT_MODE=agy : chemin de rollback (cmd_run)"
+                            cmd_run 0
+                        else
+                            cmd_pipeline ""
+                        fi ;;
+    *) err "usage: $0 [--extract [n]|--merge|--publish|--dry-run|--status|--list-failed|--retry <cible>|--migrate-manifest]"; exit 2 ;;
 esac
