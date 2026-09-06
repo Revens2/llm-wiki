@@ -167,6 +167,28 @@ manifest_state() {
 sha_of() { sha256sum -- "$1" 2>/dev/null | cut -d" " -f1; }
 
 # Liste des fichiers eligibles, un par ligne.
+
+# --- Decouverte des sources eligibles. Point unique de verite : list_eligible et
+# cmd_status DOIVENT passer par ici, sinon le status ment sur le backlog reel.
+# INGEST_EXCLUDE_DIRS : chemins absolus de repertoires elagues avant tout examen.
+# Defaut : raw/assets/ConvIA (transcripts bruts). Decision d architecture :
+# le raw ConvIA reste dans le Vault et reste indexe par le RAG, mais il ne doit
+# plus etre transforme en fiches wiki/sources. Le prefixe est teste en egalite
+# exacte : raw/assets/ConvIA-Analysis n est PAS elague et reste ingere.
+INGEST_EXCLUDE_DIRS="${INGEST_EXCLUDE_DIRS-${RAW_DIR}/assets/ConvIA}"
+
+raw_find() {
+    local sep="${1:--print0}"
+    local args=() d
+    for d in $INGEST_EXCLUDE_DIRS; do
+        args+=( -path "$d" -prune -o )
+    done
+    find "$RAW_DIR" \
+        "${args[@]}" \
+        \( -type d -name assets -not -path "*/raw/assets" -prune \) -o \
+        -type f \( -name '*.md' -o -name '*.txt' -o -name '*.docx' \) "$sep" 2>/dev/null
+}
+
 # Un fichier absent du manifeste est eligible sans calcul de hash : c'est le cas
 # de l'ecrasante majorite du backlog. Le hash n'est calcule que pour les fichiers
 # deja connus, ou il sert a detecter une modification du source.
@@ -178,7 +200,7 @@ list_eligible() {
     local tsv f st att old_sha sha
     tsv=$(mktemp)
     manifest_state | jq -r 'to_entries[]|"\(.key)\t\(.value.status)\t\(.value.attempts // 0)\t\(.value.sha256 // "")"' > "$tsv"
-    find "$RAW_DIR" \( -type d -name assets -not -path "*/raw/assets" -prune \) -o -type f \( -name '*.md' -o -name '*.txt' -o -name '*.docx' \) -print0 2>/dev/null \
+    raw_find -print0 \
     | while IFS= read -r -d '' f; do
         local rec emit=0
         rec=$(grep -m1 -F "$(printf '%s\t' "$f")" "$tsv" 2>/dev/null || true)
@@ -396,7 +418,7 @@ cmd_migrate() {
 cmd_status() {
     local total elig st ok failed skipped migrated remaining
     total=$(find "$RAW_DIR" -type f 2>/dev/null | wc -l)
-    elig=$(find "$RAW_DIR" \( -type d -name assets -not -path "*/raw/assets" -prune \) -o -type f \( -name '*.md' -o -name '*.txt' -o -name '*.docx' \) -print 2>/dev/null | wc -l)
+    elig=$(raw_find -print | wc -l)
     st=$(manifest_state)
     ok=$(printf '%s' "$st" | jq '[.[]|select(.status=="ok")]|length')
     failed=$(printf '%s' "$st" | jq '[.[]|select(.status=="failed")]|length')
