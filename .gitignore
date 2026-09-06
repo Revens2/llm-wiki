@@ -1,0 +1,16 @@
+# État runtime — jamais versionné
+.staging/
+*.log
+.ingested_manifest*
+pace.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Éditeurs / OS
+*.swp
+.DS_Store
+Thumbs.db
