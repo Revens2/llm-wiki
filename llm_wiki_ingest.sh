@@ -30,7 +30,20 @@ LINT_DUE="${STATE_DIR}/lint-due-at"
 RESUME_COUNT="${STATE_DIR}/resume-count"
 AGY_BIN="/opt/agy/bin/agy"
 
-[ -r /etc/default/llm-wiki ] && . /etc/default/llm-wiki
+# /etc/default/llm-wiki est SOURCE, donc ses affectations ecrasent ce que
+# l appelant a mis dans l environnement -- y compris un `Environment=` de
+# drop-in systemd. Constate le 2026-09-06 : un drop-in posant RAW_DIR et
+# MAX_NOTES_PER_RUN etait visible dans `systemctl show -p Environment` et
+# pourtant sans aucun effet sur le run. Un reglage qu on ne peut pas surcharger
+# rend impossible tout canary controle et tout banc d essai.
+# On sauvegarde donc l environnement EXPLICITE avant de sourcer, et on le
+# rejoue apres : le fichier fournit les defauts, l appelant garde le dernier mot.
+if [ -r /etc/default/llm-wiki ]; then
+    _env_explicite="$(export -p)"
+    . /etc/default/llm-wiki
+    eval "$_env_explicite"
+    unset _env_explicite
+fi
 # Le fichier est SOURCE, pas exporte : sans cette ligne, aucun reglage
 # ci-dessus n atteint llm_wiki_extract.py / llm_wiki_merge.py, qui les
 # lisent par os.environ. Bug latent depuis le lot 2 (EXTRACT_MODEL).
