@@ -156,3 +156,19 @@ def test_cli_dry_run_sans_llm(tmp_path):
     assert proc.returncode == 0
     out = json.loads(proc.stdout)
     assert out["ok"] == 1 and out["contract_version"] == "wiki-extract-v4"
+
+
+def test_cli_fichier_exclu_refuse(tmp_path, monkeypatch):
+    raw = tmp_path / "raw"
+    conv = raw / "assets" / "ConvIA" / "x"
+    conv.mkdir(parents=True)
+    f = conv / "brut.md"
+    f.write_text("# Brut\n\nContenu. " * 50, encoding="utf-8")
+    monkeypatch.setenv("RAW_DIR", str(raw))
+    proc = subprocess.run(
+        [sys.executable, str(REPO / "llm_wiki_extract.py"), "--file", str(f),
+         "--manifest", "none", "--dry-run"], capture_output=True, text=True,
+        timeout=60)
+    assert proc.returncode == 0
+    out = json.loads(proc.stdout)
+    assert out["ok"] == 0

@@ -173,8 +173,10 @@ INGEST_EXCLUDE_DIRS="${INGEST_EXCLUDE_DIRS-${RAW_DIR}/assets/ConvIA}"
 raw_find() {
     local sep="${1:--print0}"
     local args=() d
-    for d in $INGEST_EXCLUDE_DIRS; do
-        args+=( -path "$d" -prune -o )
+    local excl=()
+    IFS=":" read -ra excl <<< "$INGEST_EXCLUDE_DIRS"
+    for d in "${excl[@]}"; do
+        [ -n "$d" ] && args+=( -path "$d" -prune -o )
     done
     find "$RAW_DIR" \
         "${args[@]}" \

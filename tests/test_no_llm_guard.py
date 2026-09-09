@@ -23,6 +23,8 @@ FORBIDDEN = [
     "RESOURCE_EXHAUSTED",
     "EXTRACT_MODEL_CASCADE",
     "SAFETY_BLOCK_NONE",
+    "thinking_config",
+    "ModelCascade",
     "generativelanguage.googleapis.com",
 ]
 

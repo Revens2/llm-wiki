@@ -965,8 +965,14 @@ def extract_one(path, pacer, model, spool_root, manifest, dry_run=False,
                 "error": str(e), "calls": 0}
     nonce = hashlib.sha256((sha + "|" + str(stat.st_mtime_ns)).encode()).hexdigest()[:12]
 
-    # 4.2 : purge des chunks d'un sha precedent pour ce meme path.
-    gc_old_chunks(path, sha, spool_root, manifest)
+    # Chemins refusés : ni lecture (dry-run inclus), ni effet de bord.
+    # Le cycle de vie du spool appartient desormais a la file MCP
+    # (vault-mcp wiki_jobs : submit ecrase par chunk, sync marque stale).
+    # Les helpers gc_old_chunks/gc_stale_chunks restent disponibles en
+    # bibliotheque pour un nettoyage manuel, jamais en chemin automatique.
+    if _is_excluded(path, os.path.dirname(path)):
+        return {"path": path, "status": "failed", "reason": "excluded",
+                "error": "source exclue de l'ingestion", "calls": 0}
 
     # --- declencheur 1 (a priori, plan 11) ---------------------------------- #
     tokens, measured = measure_tokens(content, model)
@@ -979,7 +985,6 @@ def extract_one(path, pacer, model, spool_root, manifest, dry_run=False,
     else:
         spans = [(0, len(content))]
     total = len(spans)
-    gc_stale_chunks(sha, total, spool_root)
 
     out = {"path": path, "sha256": sha, "size": stat.st_size, "model": model,
            "calls": 0, "input_tokens": tokens, "tokens_measured": measured,
@@ -1053,6 +1058,11 @@ def main(argv=None):
     # --dry-run : plan de chunking local, aucune ecriture, aucun LLM.
     results = []
     for f in files:
+        if _is_excluded(f, RAW_DIR):
+            sys.stderr.write("[extract] exclu : %s\n" % f)
+            results.append({"path": f, "status": "skipped",
+                            "reason": "excluded"})
+            continue
         try:
             content = open(f, encoding="utf-8", errors="replace").read()
         except OSError as e:
