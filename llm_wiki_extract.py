@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""llm-wiki — PASSE 1 : extraction JSON structuree (lot 3).
+"""llm-wiki — PASSE 1 : extraction JSON structuree (lot 3, revise ChatGPT-seul).
 
-LOT 5 - le chunking est pilote par le TPM, pas par la fenetre (plan §11).
-La fenetre (1 048 576 tokens) n'est pas la contrainte active : le debit en
-tokens par minute l'est. Deux declencheurs :
-  1. a priori    - countTokens(document) > CHUNK_MIN_TOKENS (defaut 50 000) ;
-  2. a posteriori - finishReason=MAX_TOKENS (sortie plafonnee a 65 536).
-CHUNK_MIN_TOKENS s'abaisse tout seul sur rejet TPM et se persiste dans
-pace.json ; il n'est jamais remonte sans mesure. Un document rejete deux fois
-pour TPM SANS avoir ete decoupe passe en failed/oversized et sort de la file.
+Depuis la bascule ChatGPT-seul (contrat wiki-extract-v4), ce module ne fait
+PLUS AUCUN appel LLM : ni appel distant, ni mesure distante, ni binaire externe. Le
+raisonnement (production du JSON) est fait par ChatGPT via la file MCP
+`wiki_ingest_claim/read/submit` (vault-mcp `wiki_jobs.py`, autorite serveur).
+Ce qui reste ici, 100 % deterministe :
 
-Le wiki n'est JAMAIS touche par cette passe : ni lecture, ni rsync, ni ecriture.
-Sortie = un JSON valide depose au spool /var/lib/llm-wiki/spool/extract/.
+* le contrat (RESPONSE_SCHEMA + SYSTEM_PREFIX + validate + anti-entites) ;
+* le chunking (split_document/_boundary, seuils) avec un tokenizer LOCAL ;
+* le spool (enveloppe, write_atomic, gc_*) et le manifeste v3/v4.
 
-Client HTTP, pacing AIMD, quota : /usr/local/bin/llm_submit.py (lot 2). Rien
-n'est reimplemente ici.
+L'ancienne extraction LLM locale (extract_one + cascade + pacing AIMD +
+llm_submit) est RETIREE : appeler ce script sans --dry-run refuse
+explicitement au lieu de contacter un LLM distant.
 """
 from __future__ import annotations
 
@@ -30,7 +29,9 @@ import time
 import unicodedata
 
 sys.path.insert(0, "/usr/local/bin")
-import llm_submit as L  # noqa: E402
+
+CONTRACT_VERSION = "wiki-extract-v4"
+TOKENIZER = "local-cl100k-or-bytes4"
 
 __version__ = "1.0.0"
 
@@ -39,9 +40,13 @@ SPOOL_DIR = os.environ.get("EXTRACT_SPOOL", os.path.join(STATE_DIR, "spool", "ex
 RAW_DIR = os.environ.get("RAW_DIR", "/srv/vault-mirror/raw")
 WIKI_DIR = os.environ.get("WIKI_DIR", "/srv/obsidian-vault")
 MANIFEST = os.environ.get("MANIFEST", os.path.join(WIKI_DIR, ".ingested_manifest.jsonl"))
-EXTRACT_MODEL = os.environ.get("EXTRACT_MODEL", "gemini-2.5-flash-lite")
+# Nom de modele historiquement inscrit au manifeste. Depuis la bascule
+# ChatGPT-seul, la passe locale n'ecrit plus de lignes d'extraction : les
+# lignes v4 portent model="chatgpt" (file MCP). Conserve en lecture seule
+# pour l'interpretation des anciens manifestes.
+LEGACY_EXTRACT_MODEL = "gemini-2.5-flash-lite"
+MODEL_TAG = "chatgpt"
 MAX_ATTEMPTS = int(os.environ.get("MAX_ATTEMPTS", "3"))
-MAX_OUTPUT_TOKENS = int(os.environ.get("EXTRACT_MAX_OUTPUT_TOKENS", "65536"))
 SCHEMA_VERSION = 1
 
 SLUG_RE = re.compile(r"^[a-z0-9-]{1,80}$")
@@ -51,7 +56,7 @@ TOKEN_RE = re.compile(r"\{\{E:([^}]{1,120})\}\}")
 DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 # --------------------------------------------------------------------------- #
-# responseSchema — sous-ensemble Gemini STRICT.
+# responseSchema — sous-ensemble STRICT (dialecte historique, reutilise tel quel).
 # Autorises : OBJECT ARRAY STRING NUMBER INTEGER BOOLEAN, enum, items,
 # properties, required, nullable, propertyOrdering.
 # INTERDITS : $ref, anyOf, oneOf, minItems/maxItems, pattern.
@@ -544,7 +549,7 @@ def validate(doc, source_path=None):
 # document repart en "quota", reste eligible, et bloque la file a chaque run.
 #
 # Deux declencheurs, donc :
-#   1. a priori  : countTokens(document) > CHUNK_MIN_TOKENS  -> on decoupe.
+#   1. a priori  : mesure(document) > CHUNK_MIN_TOKENS  -> on decoupe.
 #   2. a posteriori : finishReason=MAX_TOKENS (sortie plafonnee) -> inchange.
 # Plus un abaissement adaptatif du seuil et un garde-fou anti-boucle dur.
 # --------------------------------------------------------------------------- #
@@ -556,32 +561,52 @@ CHUNK_TARGET_RATIO = float(os.environ.get("CHUNK_TARGET_RATIO", "0.9"))
 CHUNK_OVERLAP_RATIO = float(os.environ.get("CHUNK_OVERLAP_RATIO", "0.08"))
 # Nombre de rejets TPM SANS decoupe tolerés avant mise en failed/oversized.
 MAX_TPM_REJECTS = int(os.environ.get("MAX_TPM_REJECTS", "2"))
-# Repli si countTokens est injoignable : ratio mesure sur le corpus (2 693 fichiers).
+# Repli local : ratio mesure sur le corpus (2 693 fichiers).
 BYTES_PER_TOKEN = float(os.environ.get("BYTES_PER_TOKEN", "2.44"))
 
 HEADING_RE = re.compile(r"^#{1,6} ", re.M)
 
 
+def _pace_file() -> str:
+    return os.path.join(STATE_DIR, "pace.json")
+
+
 def chunk_min_tokens(pacer=None):
     """Seuil effectif : la valeur decouverte a l'execution prime sur le defaut,
-    et seulement si elle est PLUS BASSE. On ne remonte jamais tout seul."""
-    st = pacer.state if pacer is not None else L.load_pace()
-    learned = int(st.get("chunk_min_tokens") or 0)
+    et seulement si elle est PLUS BASSE. On ne remonte jamais tout seul.
+    (Local : lit pace.json directement, sans client LLM.)"""
+    try:
+        with open(_pace_file(), encoding="utf-8") as fh:
+            learned = int((json.load(fh) or {}).get("chunk_min_tokens") or 0)
+    except (OSError, ValueError):
+        learned = 0
     if learned and learned < CHUNK_MIN_TOKENS:
         return max(CHUNK_MIN_TOKENS_FLOOR, learned)
     return CHUNK_MIN_TOKENS
 
 
 def lower_chunk_min_tokens(pacer, measured_tokens):
-    """Un 429 de quota TOKEN a frappe un document sous le seuil : le debit reel
-    est plus bas que ce qu'on croyait. On abaisse et on persiste, exactement
-    comme interval_ms. Renvoie le nouveau seuil, ou None si rien n'a bouge."""
+    """Abaisse le seuil et le persiste (local, sans pacing LLM)."""
     cur = chunk_min_tokens(pacer)
     new = max(CHUNK_MIN_TOKENS_FLOOR, int(measured_tokens * 0.8))
     if new >= cur:
         return None
-    pacer.state["chunk_min_tokens"] = new
-    pacer.persist()          # durable tout de suite : un run peut mourir en 75
+    try:
+        try:
+            with open(_pace_file(), encoding="utf-8") as fh:
+                st = json.load(fh) or {}
+        except (OSError, ValueError):
+            st = {}
+        st["chunk_min_tokens"] = new
+        os.makedirs(STATE_DIR, exist_ok=True)
+        tmp = _pace_file() + ".tmp.%d" % os.getpid()
+        with open(tmp, "w", encoding="utf-8") as fh:
+            json.dump(st, fh)
+            fh.flush()
+            os.fsync(fh.fileno())
+        os.replace(tmp, _pace_file())
+    except OSError:
+        pass
     return new
 
 
@@ -716,15 +741,25 @@ def tpm_reject_count(path, sha, manifest=None):
     return n
 
 
-def measure_tokens(content, model):
-    """(tokens, mesure_reelle). Un echec de countTokens ne doit JAMAIS faire
-    passer un gros document pour un petit : on retombe sur l'estimation par
-    octets, qui surestime plutot qu'elle ne sous-estime."""
+def estimate_tokens_local(content: str) -> tuple[int, str]:
+    """Compte-tokens deterministe SANS service LLM.
+
+    Tente `tiktoken` (cl100k_base) si installe, sinon repli documente
+    `octets / 4` qui surestime plutot qu'elle ne sous-estime (un echec de
+    mesure ne doit JAMAIS faire passer un gros document pour un petit).
+    """
     try:
-        return L.count_tokens(content, model=model, timeout=60.0), True
-    except Exception as e:
-        sys.stderr.write("[extract] countTokens indisponible (%s), estimation octets\n" % e)
-        return int(len(content.encode("utf-8")) / BYTES_PER_TOKEN) + 1, False
+        import tiktoken  # type: ignore
+
+        enc = tiktoken.get_encoding("cl100k_base")
+        return len(enc.encode(content)), "tiktoken-cl100k"
+    except Exception:
+        return int(len(content.encode("utf-8")) / BYTES_PER_TOKEN) + 1, "bytes-fallback"
+
+
+def measure_tokens(content, model=None):
+    """(tokens, mesure_locale). Signature conservee ; `model` ignore."""
+    return estimate_tokens_local(content)
 
 
 def spool_path(sha, chunk=0, root=None):
@@ -750,12 +785,15 @@ def write_atomic_json(path, obj):
 
 def manifest_append(path, sha, size, mtime, status, reason, attempts, duration,
                     model, manifest=None, chunks_total=1, chunks_done=1):
-    """Manifeste v3 : append-only, phase=extract. produced reste vide (la passe 1
-    n'ecrit rien dans le wiki). Un quota n'incremente JAMAIS attempts."""
+    """Manifeste v3/v4 : append-only, phase=extract. produced reste vide (la passe 1
+    n'ecrit rien dans le wiki). Un quota n'incremente JAMAIS attempts.
+    v4 ajoute `contract_version` + `tokenizer` (additif, jamais destructif)."""
     mf = manifest or MANIFEST
     if mf in ("", "none", "-"):
         return
-    line = {"schema": 3, "path": path, "sha256": sha, "size": size, "mtime": mtime,
+    line = {"schema": 3, "contract_version": CONTRACT_VERSION,
+            "tokenizer": TOKENIZER,
+            "path": path, "sha256": sha, "size": size, "mtime": mtime,
             "ingested_at": _dt.datetime.now(_dt.timezone.utc)
                               .strftime("%Y-%m-%dT%H:%M:%SZ"),
             "phase": "extract", "status": status,
@@ -820,6 +858,33 @@ def eligible(path, state):
     return True, att
 
 
+def _exclude_dirs(root: str = "") -> list[str]:
+    """Dossiers exclus, meme semantique que INGEST_EXCLUDE_DIRS d'ingest.sh.
+
+    Corrige l'ecart historique : l'exclusion `raw/assets/ConvIA` ne valait que
+    cote ingest.sh (historique), pas cote extract. Desormais un seul filtre partage.
+    Le defaut suit la racine SCANNEE (pas la constante d'import), plus la liste
+    d'environnement éventuelle.
+    """
+    out = [d for d in os.environ.get("INGEST_EXCLUDE_DIRS", "").split(":")
+           if d.strip()]
+    base = root or RAW_DIR
+    out.append(os.path.join(base, "assets", "ConvIA"))
+    return out
+
+
+def _is_excluded(path: str, root: str = "") -> bool:
+    def norm(p: str) -> str:
+        return p.replace("\\", "/").rstrip("/")
+
+    src = norm(path)
+    for ex in _exclude_dirs(root):
+        ex = norm(ex)
+        if ex and (src == ex or src.startswith(ex + "/")):
+            return True
+    return False
+
+
 def list_files(root, limit=0):
     out = []
     root_assets = os.path.join(root, "assets")
@@ -827,9 +892,15 @@ def list_files(root, limit=0):
         dirnames[:] = [d for d in dirnames
                        if not (d == "assets" and
                                os.path.join(dirpath, d) != root_assets)]
+        # Elague les dossiers exclus (ConvIA raw, etc.).
+        dirnames[:] = [d for d in dirnames
+                       if not _is_excluded(os.path.join(dirpath, d), root)]
         for fn in sorted(filenames):
             if fn.lower().endswith((".md", ".txt")):
-                out.append(os.path.join(dirpath, fn))
+                full = os.path.join(dirpath, fn)
+                if _is_excluded(full, root):
+                    continue
+                out.append(full)
     out.sort()
     if limit:
         out = out[:limit]
@@ -840,11 +911,10 @@ def list_files(root, limit=0):
 # Extraction d'un fichier
 # --------------------------------------------------------------------------- #
 def _one_call(prompt, pacer, model, timeout):
-    return pacer.run_one(prompt, model=model, response_schema=RESPONSE_SCHEMA,
-                         max_output_tokens=MAX_OUTPUT_TOKENS, timeout=timeout,
-                         temperature=0.0,
-                         safety_settings=L.SAFETY_BLOCK_NONE,
-                         thinking=L.thinking_config(model))
+    """RETIRE : aucun appel LLM local depuis la bascule ChatGPT-seul."""
+    raise RuntimeError(
+        "extraction LLM locale retiree ; utiliser la file MCP"
+        " wiki_ingest_claim/read/submit (contrat %s)" % CONTRACT_VERSION)
 
 
 def _envelope(doc, path, sha, size, model, usage, warns, idx, total):
@@ -922,139 +992,34 @@ def extract_one(path, pacer, model, spool_root, manifest, dry_run=False,
                    duration_s=round(time.time() - t0, 2))
         return out
 
-    calls = 0
-    usage_tot = {}
-    warns_all = []
-    n_ent = n_rel = n_sec = 0
-    for idx, (a, b) in enumerate(spans):
-        if _chunk_done(spool_root, sha, idx, total):
-            sys.stderr.write("[extract]   chunk %d/%d deja au spool, saute\n"
-                             % (idx + 1, total))
-            continue
-        piece = content[a:b]
-        prompt = build_prompt(piece, nonce, os.path.basename(path))
-        try:
-            res = _one_call(prompt, pacer, model, timeout)
-        except L.QuotaExhausted as e:
-            dur = time.time() - t0
-            # Un 429 "minute" survivant aux reprises locales sur un document NON
-            # decoupe est un rejet TPM : c'est le mode de panne du 11.
-            if total == 1 and e.scope == "minute":
-                prior = tpm_reject_count(path, sha, manifest)
-                low = lower_chunk_min_tokens(pacer, tokens)
-                if low:
-                    sys.stderr.write("[extract] CHUNK_MIN_TOKENS abaisse a %d "
-                                     "(rejet TPM a %d tokens)\n" % (low, tokens))
-                manifest_append(path, sha, stat.st_size, int(stat.st_mtime),
-                                "quota", "tpm_reject", 0, dur, model, manifest,
-                                total, idx)
-                if prior + 1 >= MAX_TPM_REJECTS:
-                    # Garde-fou anti-boucle OBLIGATOIRE (11) : mieux vaut un
-                    # document signale qu'une file bloquee par lui a chaque run.
-                    manifest_append(path, sha, stat.st_size, int(stat.st_mtime),
-                                    "failed", "oversized", MAX_ATTEMPTS, dur,
-                                    model, manifest, total, idx)
-                    sys.stderr.write("[extract] OVERSIZED : %s sort de la file "
-                                     "(%d rejets TPM sans decoupe)\n"
-                                     % (os.path.basename(path), prior + 1))
-            else:
-                manifest_append(path, sha, stat.st_size, int(stat.st_mtime),
-                                "quota", "quota_" + e.scope, 0, dur, model,
-                                manifest, total, idx)
-            e._handled = True
-            raise
-        calls += 1
-        dur = time.time() - t0
-
-        if res["status"] != "ok":
-            # Declencheur 2 (a posteriori) : sortie plafonnee. Si le document
-            # n'etait PAS decoupe, on abaisse le seuil pour qu'il le soit au
-            # prochain passage au lieu de rejouer le meme echec.
-            reason = {"truncated": "output_truncated", "blocked": "blocked",
-                      "invalid": "api_invalid", "timeout": "timeout",
-                      "http_error": "http_error"}.get(res["status"], res["status"])
-            if res["status"] == "truncated" and total == 1:
-                low = lower_chunk_min_tokens(pacer, tokens)
-                if low:
-                    sys.stderr.write("[extract] CHUNK_MIN_TOKENS abaisse a %d "
-                                     "(MAX_TOKENS sur %d tokens d'entree)\n"
-                                     % (low, tokens))
-            out.update(status="failed", reason=reason, calls=calls,
-                       duration_s=round(dur, 2), failed_chunk=idx,
-                       error=(res.get("raw_error") or "")[:400],
-                       finish_reason=res.get("finish_reason"))
-            manifest_append(path, sha, stat.st_size, int(stat.st_mtime), "failed",
-                            reason, att0 + 1, dur, model, manifest, total, idx)
-            return out
-
-        try:
-            doc = json.loads(res["text"])
-        except Exception as ex:
-            out.update(status="failed", reason="extract_invalid", calls=calls,
-                       duration_s=round(dur, 2), failed_chunk=idx,
-                       error="JSON illisible malgre responseSchema: %s" % ex)
-            manifest_append(path, sha, stat.st_size, int(stat.st_mtime), "failed",
-                            "extract_invalid", att0 + 1, dur, model, manifest,
-                            total, idx)
-            return out
-
-        ok, errs, warns, doc = validate(doc, source_path=path)
-        warns_all += warns
-        if not ok:
-            out.update(status="failed", reason="extract_invalid", errors=errs,
-                       calls=calls, duration_s=round(dur, 2), failed_chunk=idx)
-            manifest_append(path, sha, stat.st_size, int(stat.st_mtime), "failed",
-                            "extract_invalid", att0 + 1, dur, model, manifest,
-                            total, idx)
-            return out
-
-        n_ent += len(doc.get("entities") or [])
-        n_rel += len(doc.get("relations") or [])
-        n_sec += len(((doc.get("note") or {}).get("sections")) or [])
-        u = res.get("usage") or {}
-        for k, v in u.items():
-            if isinstance(v, int):
-                usage_tot[k] = usage_tot.get(k, 0) + v
-        write_atomic_json(spool_path(sha, idx, spool_root),
-                          _envelope(doc, path, sha, stat.st_size, model, u,
-                                    warns, idx, total))
-        if total > 1:
-            sys.stderr.write("[extract]   chunk %d/%d ok (ent=%d rel=%d)\n"
-                             % (idx + 1, total, len(doc.get("entities") or []),
-                                len(doc.get("relations") or [])))
-
-    dur = time.time() - t0
-    out.update(status="extracted", calls=calls, duration_s=round(dur, 2),
-               usage=usage_tot, n_entities=n_ent, n_relations=n_rel,
-               n_sections=n_sec, warnings=warns_all,
-               spool=spool_path(sha, 0, spool_root))
-    manifest_append(path, sha, stat.st_size, int(stat.st_mtime), "extracted", None,
-                    att0 + 1, dur, model, manifest, total, total)
+    # -- EXTRACTION LLM RETIREE (bascule ChatGPT-seul, contrat v4) ---------- #
+    # La production du JSON est faite par ChatGPT via la file MCP
+    # (wiki_ingest_claim -> wiki_ingest_read -> wiki_ingest_submit). Ce chemin
+    # local ne contacte plus aucun LLM : il refuse au lieu de payer une
+    # extraction. Le dry-run ci-dessus reste le seul mode local (plan de
+    # chunking), avec --print-schema.
+    out.update(status="refused", reason="llm_retired", calls=0,
+               duration_s=round(time.time() - t0, 2),
+               error="extraction LLM locale retiree ; utiliser la file MCP"
+                     " wiki_ingest_claim/read/submit (contrat v4)")
     return out
 
 
 # --------------------------------------------------------------------------- #
 def main(argv=None):
-    ap = argparse.ArgumentParser(description="llm-wiki passe 1 (extraction JSON)")
+    ap = argparse.ArgumentParser(description="llm-wiki passe 1 (DETERMINE, sans LLM)")
     ap.add_argument("--file", action="append", default=[],
-                    help="fichier a extraire (repetable). Sans lui : parcours de RAW_DIR.")
+                    help="fichier a examiner (repetable). Sans lui : parcours de RAW_DIR.")
     ap.add_argument("--files-from", help="fichier listant un chemin par ligne")
     ap.add_argument("--limit", type=int, default=0)
-    ap.add_argument("--max-calls", type=int, default=0,
-                    help="plafond DUR d'appels reels pour ce run (0 = illimite)")
-    ap.add_argument("--model", default=None,
-                    help="EPINGLE un seul modele (bancs d'essai). Sans lui, la "
-                         "cascade EXTRACT_MODEL_CASCADE est utilisee.")
-    ap.add_argument("--cascade", default=None,
-                    help="ordre de cascade explicite, separe par des virgules")
     ap.add_argument("--spool", default=SPOOL_DIR)
     ap.add_argument("--manifest", default=MANIFEST,
                     help="'none' pour ne rien ecrire au manifeste (bancs d'essai)")
     ap.add_argument("--ignore-manifest", action="store_true",
-                    help="ne filtre pas par eligibilite (comparatif de modeles)")
-    ap.add_argument("--dry-run", action="store_true")
+                    help="ne filtre pas par eligibilite")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="plan de chunking local uniquement (aucun LLM, aucune ecriture)")
     ap.add_argument("--report", help="chemin du rapport JSONL par fichier")
-    ap.add_argument("--timeout", type=float, default=600.0)
     ap.add_argument("--print-schema", action="store_true")
     a = ap.parse_args(argv)
 
@@ -1076,98 +1041,46 @@ def main(argv=None):
     if a.limit:
         files = files[:a.limit]
 
-    # Une cle absente n'est pas une faute du document : on echoue vite et
-    # proprement (exit 2), sans traceback ni ligne de manifeste parasite.
-    if (os.environ.get("SUBMIT_MODE") or "interactive") == "interactive"             and not os.environ.get("GEMINI_API_KEY", "").strip():
-        sys.stderr.write("[extract] GEMINI_API_KEY absente "
-                         "(EnvironmentFile=/etc/llm-wiki/gemini.env)\n")
+    if not a.dry_run:
+        sys.stderr.write(
+            "[extract] extraction LLM locale RETIREE (bascule ChatGPT-seul).\n"
+            "[extract] Produire l'extraction via la file MCP : wiki_ingest_claim"
+            " -> wiki_ingest_read -> wiki_ingest_submit (contrat %s).\n"
+            "[extract] Seuls --dry-run (plan de chunking) et --print-schema"
+            " restent disponibles localement.\n" % CONTRACT_VERSION)
         return 2
 
-    pacer = L.Pacer()
-    # Cascade par qualite decroissante. --model l'epingle a un seul modele :
-    # c'est ce que doivent faire les bancs d'essai, sinon un modele epuise
-    # ferait basculer la mesure sur un autre et fausserait la comparaison.
-    if a.model:
-        cascade = L.ModelCascade(pacer, [a.model])
-    else:
-        cascade = L.ModelCascade(pacer, a.cascade)
-    sys.stderr.write("[extract] cascade: %s\n" % ", ".join(cascade.order))
-    calls = 0
+    # --dry-run : plan de chunking local, aucune ecriture, aucun LLM.
     results = []
-    rc = 0
-    quota = False
-    model = cascade.order[0] if cascade.order else EXTRACT_MODEL
-    try:
-        for f in files:
-            if a.max_calls and calls >= a.max_calls:
-                sys.stderr.write("[extract] plafond --max-calls=%d atteint\n" % a.max_calls)
-                break
-            r = None
-            while r is None:
-                try:
-                    model = cascade.current()
-                except L.AllModelsExhausted as e:
-                    quota = True
-                    sys.stderr.write("[extract] cascade epuisee, arret propre: %s %s\n"
-                                     % (e, json.dumps(e.detail.get("blocked_until", {}),
-                                                      ensure_ascii=False)))
-                    stt = os.stat(f)
-                    manifest_append(f, sha_of(f), stt.st_size, int(stt.st_mtime),
-                                    "quota", "quota_cascade_exhausted",
-                                    0, 0.0, model, a.manifest)
-                    rc = 75
-                    break
-                try:
-                    r = extract_one(f, pacer, model, a.spool, a.manifest,
-                                    dry_run=a.dry_run, timeout=a.timeout)
-                except L.SafetyMarginReached as e:
-                    sys.stderr.write("[extract] marge de securite: %s\n" % e)
-                    break
-                except L.QuotaExhausted as e:
-                    scope = getattr(e, "scope", "daily")
-                    if scope == "daily" and len(cascade.order) > 1:
-                        # Quota JOURNALIER du modele courant : on descend d'un cran
-                        # dans la cascade et on REJOUE le meme document.
-                        # attempts reste inchange : un quota n'est pas une faute.
-                        if pacer.model_blocked_for(model) <= 0:
-                            pacer.mark_model_exhausted(model, max(e.reset_s, 60.0))
-                            pacer.persist()
-                        sys.stderr.write("[extract] %s epuise (journalier), bascule\n"
-                                         % model)
-                        continue
-                    quota = True
-                    sys.stderr.write("[extract] quota, arret propre: %s\n" % e)
-                    # extract_one journalise lui-meme quand il sait distinguer un
-                    # rejet TPM d'un quota journalier. Ne pas ecrire deux lignes.
-                    if not getattr(e, "_handled", False):
-                        stt = os.stat(f)
-                        manifest_append(f, sha_of(f), stt.st_size, int(stt.st_mtime),
-                                        "quota", "quota_" + scope,
-                                        0, 0.0, model, a.manifest)
-                    rc = 75
-                    break
-            if r is None:
-                break
-            calls += r.get("calls", 0)
-            results.append(r)
-            sys.stderr.write("[extract] %-9s %-7s ent=%s rel=%s [%s] %s\n" % (
-                r["status"], "%.1fs" % r.get("duration_s", 0),
-                r.get("n_entities", "-"), r.get("n_relations", "-"),
-                model, os.path.basename(f)))
-    finally:
-        if not a.dry_run:
-            pacer.finish_run(quota=quota)
-        if a.report:
-            with open(a.report, "a", encoding="utf-8") as fh:
-                for r in results:
-                    fh.write(json.dumps(r, ensure_ascii=False) + "\n")
-
-    okn = sum(1 for r in results if r["status"] in ("extracted", "dry-run"))
-    sys.stderr.write("[extract] %d/%d ok, %d appels\n" % (okn, len(results), calls))
-    print(json.dumps({"files": len(results), "ok": okn, "calls": calls,
-                      "model": model, "cascade": list(cascade.order),
-                      "per_model": cascade.counts()}, ensure_ascii=False))
-    return rc
+    for f in files:
+        try:
+            content = open(f, encoding="utf-8", errors="replace").read()
+        except OSError as e:
+            results.append({"path": f, "status": "failed", "reason": "unreadable",
+                            "error": str(e)})
+            continue
+        tokens, how = estimate_tokens_local(content)
+        thr = chunk_min_tokens(None)
+        if tokens > thr:
+            target = max(CHUNK_MIN_TOKENS_FLOOR, int(thr * CHUNK_TARGET_RATIO))
+            cpt = len(content) / float(tokens)
+            spans = split_document(content, target * cpt,
+                                   target * cpt * CHUNK_OVERLAP_RATIO)
+        else:
+            spans = [(0, len(content))]
+        results.append({"path": f, "status": "dry-run", "tokens": tokens,
+                        "tokenizer": how, "chunk_min_tokens": thr,
+                        "spans": [{"i": i, "start": a, "end": b, "chars": b - a}
+                                  for i, (a, b) in enumerate(spans)]})
+    if a.report:
+        with open(a.report, "a", encoding="utf-8") as fh:
+            for r in results:
+                fh.write(json.dumps(r, ensure_ascii=False) + "\n")
+    okn = sum(1 for r in results if r["status"] == "dry-run")
+    print(json.dumps({"files": len(results), "ok": okn,
+                      "contract_version": CONTRACT_VERSION,
+                      "tokenizer": TOKENIZER}, ensure_ascii=False))
+    return 0
 
 
 if __name__ == "__main__":
